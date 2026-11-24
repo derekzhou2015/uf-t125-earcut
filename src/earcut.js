@@ -15,7 +15,8 @@
  */
 
 // single-vertex holes to preserve through filterPoints (steiner points); kept off the Node
-// shape since they're rare — the empty-set fast path means non-steiner inputs pay nothing
+// shape since they're rare — the empty-set fast path means non-steiner inputs pay nothing.
+// Cleared at every earcut call's end so its node refs don't retain the call's graph.
 /** @type {Set<Node>} */
 const steiners = new Set();
 
@@ -76,6 +77,11 @@ export default function earcut(data, holeIndices, dim = 2) {
 
     earcutLinked(outerNode, triangles, minX, minY, invSize);
     while (splitStack.length) earcutLinked(/** @type {Node} */ (splitStack.pop()), triangles, minX, minY, invSize);
+
+    // release the steiner node refs at scope exit so this call's graph is collectable; the entry
+    // clear above only guards a call that threw while steiners was non-empty (and stays a no-op
+    // on the empty-set fast path)
+    if (steiners.size) steiners.clear();
 
     return triangles;
 }
@@ -293,6 +299,27 @@ function splitEarcut(start) {
 // true only while eliminateHoles merges holes, so removeNode keeps the block index live (growBlock)
 let indexActive = false;
 
+// Block-bbox index state for findHoleBridge (issue #183). The index itself and its helpers are
+// defined below, after the merge code; declared here because eliminateHoles drives its lifecycle.
+// One [minX,minY,maxX,maxY] bbox per K consecutive ring edges, in a flat Float64Array, lets the
+// leftward-ray scan skip whole blocks in O(1) instead of walking the entire merged ring. Grown
+// append-only — the outer ring seeds it, then each merged hole appends a segment; buffers are
+// sized once from the input upper bound and reused across calls.
+const K = 16; // edges per block
+
+let blockBBox = new Float64Array(0); // [minX,minY,maxX,maxY] per block
+let numBlocks = 0;
+/** @type {Node[]} */
+const blockHead = []; // first node of each block's segment
+/** @type {Node[]} */
+const blockStop = []; // node just past each block's segment (exclusive walk bound)
+// high-water capacity of the two node-ref arrays; entries in [numBlocks, blockCapacity) are
+// leftovers from a previous, larger input and would pin that call's whole node graph (one ref
+// reaches the ring through prev/next) unless nulled. indexReleased says the in-use prefix
+// [0, numBlocks) was released at the last call's end, so its slots are already null.
+let blockCapacity = 0;
+let indexReleased = true;
+
 // link every hole into the outer loop, producing a single-ring polygon without holes
 /** @param {ArrayLike<number>} data @param {ArrayLike<number>} holeIndices @param {Node} outerNode @param {number} dim @returns {Node} */
 function eliminateHoles(data, holeIndices, outerNode, dim) {
@@ -320,6 +347,17 @@ function eliminateHoles(data, holeIndices, outerNode, dim) {
         outerNode = eliminateHole(queue[i], outerNode);
     }
     indexActive = false;
+
+    // End of the block index's lifetime: the merged ring is the only thing earcutLinked needs, so
+    // null every in-use slot here rather than at the next call's start. Releasing on scope exit
+    // (vs. lazily on the next buildBlockIndex) means the node graph is collectable as soon as this
+    // call returns, and slots in [numBlocks, blockCapacity) — the high-water tail from a previously
+    // larger input — stay null across shrinking inputs. Backing array capacity is kept (no
+    // reallocation churn on the hot path); only the node references are dropped. blockBBox holds
+    // plain numbers and retains nothing.
+    blockHead.fill(/** @type {Node} */ (/** @type {unknown} */ (null)), 0, numBlocks);
+    blockStop.fill(/** @type {Node} */ (/** @type {unknown} */ (null)), 0, numBlocks);
+    indexReleased = true;
 
     // collapse collinear/coincident points across the whole merged ring once before clipping
     return filterPoints(outerNode);
@@ -363,25 +401,13 @@ function eliminateHole(hole, outerNode) {
     return filterPoints(bridge, bridge.next);
 }
 
-// Block-bbox index for findHoleBridge (issue #183): one [minX,minY,maxX,maxY] bbox per K
-// consecutive ring edges, in a flat Float64Array, so the leftward-ray scan can skip whole
-// blocks in O(1) instead of walking the entire merged ring. Grown append-only — the outer
-// ring seeds it, then each merged hole appends a segment (head node, stop node, K-blocks
-// over head..stop); independent segments, not a ring tiling, since splices land mid-ring.
-// Buffers are sized once from the input upper bound and reused across calls.
+// Block-bbox index helpers for findHoleBridge (issue #183). State (K, blockBBox, blockHead,
+// blockStop, numBlocks, blockCapacity, indexReleased) is declared next to eliminateHoles above.
 //
 // filterPoints only drops collinear/coincident points, so a stale bbox stays a conservative
 // superset of its live edges (never a false skip); the scan skips dead nodes (p.prev.next !==
 // p) and lazily advances a dead stop. Blocks are scanned in append (not ring) order, so the
 // chosen bridge can differ from the un-indexed code — a different but equally valid result.
-const K = 16; // edges per block
-
-let blockBBox = new Float64Array(0); // [minX,minY,maxX,maxY] per block
-let numBlocks = 0;
-/** @type {Node[]} */
-const blockHead = []; // first node of each block's segment
-/** @type {Node[]} */
-const blockStop = []; // node just past each block's segment (exclusive walk bound)
 
 /** @param {number} maxNodes @param {number} numHoles */
 function buildBlockIndex(maxNodes, numHoles) {
@@ -389,7 +415,17 @@ function buildBlockIndex(maxNodes, numHoles) {
     // trailing block per appended segment (outer ring + one per hole)
     const maxBlocks = Math.ceil((maxNodes + 2 * numHoles) / K) + numHoles + 2;
     if (blockBBox.length < maxBlocks * 4) blockBBox = new Float64Array(maxBlocks * 4);
+    // Defensive only: on a normal return eliminateHoles releases every in-use slot, so this is a
+    // no-op. It matters solely if a previous call threw mid-merge — then the high-water tail (and
+    // any slots the throw skipped past) still hold dead node refs, and numBlocks has not yet been
+    // recomputed, so null the full capacity here rather than strand the old graph.
+    if (!indexReleased) {
+        blockHead.fill(/** @type {Node} */ (/** @type {unknown} */ (null)), 0, blockCapacity);
+        blockStop.fill(/** @type {Node} */ (/** @type {unknown} */ (null)), 0, blockCapacity);
+    }
+    blockCapacity = blockHead.length;
     numBlocks = 0;
+    indexReleased = false; // slots get node refs from indexSegment until eliminateHoles releases them
 }
 
 // index the ring run head..stop (exclusive) as ceil(len / K) blocks; head === stop means

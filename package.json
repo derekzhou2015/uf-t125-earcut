@@ -14,8 +14,9 @@
     "dist/earcut.dev.js"
   ],
   "scripts": {
-    "pretest": "eslint src test/test.js bench/*.js viz/viz.js && tsc",
+    "pretest": "eslint src test/*.js bench/*.js viz/viz.js && tsc",
     "test": "node --test",
+    "test:mem": "node --expose-gc --test test/memory.test.js",
     "bench": "node bench/bench-tiles.js",
     "build": "rollup -c",
     "prepublishOnly": "npm test && npm run build",
